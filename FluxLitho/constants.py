@@ -1,0 +1,8 @@
+# Elegoo Mars 2 Panel-Daten (mm)
+PANEL_MM_W = 129.0
+PANEL_MM_H = 80.0
+
+# Export-Parameter
+MOTIF_THICKNESS_MM = 0.5
+FRAME_HEIGHT_MM = 0.2
+SVG_SAMPLE_SPACING = 0.6
