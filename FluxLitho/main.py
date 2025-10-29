@@ -1,6 +1,6 @@
 import sys
 from PySide6.QtWidgets import QApplication
-from gui import BrassEtcherGUI
+from gui.main_window import BrassEtcherGUI
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

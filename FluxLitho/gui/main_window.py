@@ -2,74 +2,33 @@ from PySide6.QtWidgets import (
     QMainWindow, QFileDialog, QMenu,
     QGraphicsView, QGraphicsScene, QGraphicsRectItem,
     QVBoxLayout, QWidget, QHBoxLayout, QLabel, QLineEdit, QGraphicsPathItem,
-    QToolBar, QDialog, QDialogButtonBox, QVBoxLayout as QVLayout, QCheckBox
+    QToolBar, QDialog
 )
 from PySide6.QtCore import Qt, QRectF, QPointF, QTimer
 from PySide6.QtGui import QPen, QColor, QIcon, QAction, QKeySequence
 
-import os
-import zipfile
-import tempfile
-from pathlib import Path
-
 from shapely import affinity
-from shapely import ops as sops
-from shapely import geometry as sgeom
-
-# pcb-tools
-try:
-    from gerber import load_layer
-    from gerber.primitives import Region, Circle, Rectangle, Line
-except Exception:
-    load_layer = None
-    Region = Circle = Rectangle = Line = object
 
 from constants import PANEL_MM_W, PANEL_MM_H
 from svg_utils import svg_to_polygon, shapely_to_qpath
 from mesh_utils import build_and_transform_mesh
 
+from .layer_dialog import DynamicLayerDialog
+from .gerber_utils import collect_gerber_files, load_gerber_files
 
-# ---------------------------- Gerber-Layer-Dialog ----------------------------
-class DynamicLayerDialog(QDialog):
-    def __init__(self, layer_display_names, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Gerber-Layer auswählen")
-        layout = QVLayout(self)
-        self.checks = []
+from pathlib import Path
 
-        def default_on(name: str) -> bool:
-            low = name.lower()
-            keys = ("top", "bottom", "copper", "cu", "mask", "soldermask", "solder_mask", "silk", "legend")
-            return any(k in low for k in keys)
-
-        for name in layer_display_names:
-            cb = QCheckBox(name)
-            cb.setChecked(default_on(name))
-            layout.addWidget(cb)
-            self.checks.append(cb)
-
-        btns = QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        buttonBox = QDialogButtonBox(btns)
-        buttonBox.accepted.connect(self.accept)
-        buttonBox.rejected.connect(self.reject)
-        layout.addWidget(buttonBox)
-
-    def selected_names(self):
-        return [cb.text() for cb in self.checks if cb.isChecked()]
-
-
-# ---------------------------- Haupt-GUI ----------------------------
 class BrassEtcherGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BrassEtcher – STL/3MF Export")
+        self.setWindowTitle("FluxLitho – STL/3MF Export")
         self.resize(1000, 800)
 
-        # ---------- Zentrales Widget ----------
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
 
+        # Scene + View
         self.scene = QGraphicsScene()
         self.view = QGraphicsView(self.scene)
         self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -77,7 +36,7 @@ class BrassEtcherGUI(QMainWindow):
         self.view.setViewportMargins(20, 20, 20, 20)
         layout.addWidget(self.view)
 
-        # ---------- Eingaben ----------
+        # Controls
         ctrl_layout = QHBoxLayout()
         self.width_edit = QLineEdit("50")
         self.height_edit = QLineEdit("50")
@@ -87,11 +46,11 @@ class BrassEtcherGUI(QMainWindow):
         ctrl_layout.addWidget(self.width_edit)
         ctrl_layout.addWidget(QLabel("Höhe [mm]:"))
         ctrl_layout.addWidget(self.height_edit)
-        ctrl_layout.addWidget(QLabel("SVG Breite [mm]:"))
+        ctrl_layout.addWidget(QLabel("Motiv Breite [mm]:"))
         ctrl_layout.addWidget(self.svg_width_edit)
         layout.addLayout(ctrl_layout)
 
-        # ---------- Toolbar ----------
+        # Toolbar
         tb = QToolBar("Werkzeuge")
         tb.setMovable(False)
         self.addToolBar(tb)
@@ -101,7 +60,7 @@ class BrassEtcherGUI(QMainWindow):
         act_mirror_h = QAction(QIcon("icons/mirror_h.svg"), "Horizontal spiegeln (H)", self)
         act_mirror_v = QAction(QIcon("icons/mirror_v.svg"), "Vertikal spiegeln (V)", self)
         act_rotate_90 = QAction(QIcon("icons/rotate.svg"), "90° drehen (R)", self)
-        act_center = QAction(QIcon("icons/center.svg"), "Zentrieren (auf Rohling)", self)
+        act_center = QAction(QIcon("icons/center.svg"), "Zentrieren (Z)", self)
 
         # Menü für Import
         import_menu = QMenu()
@@ -127,19 +86,21 @@ class BrassEtcherGUI(QMainWindow):
         act_mirror_h.setShortcut(QKeySequence("H"))
         act_mirror_v.setShortcut(QKeySequence("V"))
         act_rotate_90.setShortcut(QKeySequence("R"))
+        act_center.setShortcut(QKeySequence("Z"))
 
-        # ---------- State ----------
+        # State
         self.motif_geom = None
         self.motif_qpath = None
         self.motif_item: QGraphicsPathItem | None = None
         self.panel_item = None
         self.rohteil_item = None
 
+        # Timer
         self._refit_timer = QTimer(self)
         self._refit_timer.setSingleShot(True)
         self._refit_timer.setInterval(16)
 
-        # ---------- Events ----------
+        # Events
         act_save.triggered.connect(self.save_dialog)
         act_mirror_h.triggered.connect(self.mirror_horizontal)
         act_mirror_v.triggered.connect(self.mirror_vertical)
@@ -151,11 +112,10 @@ class BrassEtcherGUI(QMainWindow):
         self.svg_width_edit.editingFinished.connect(self.rescale_svg_only)
         self.scene.changed.connect(self.schedule_refit)
 
-        # ---------- Start ----------
         self.update_display()
         QTimer.singleShot(0, self.refit_view)
 
-    # ================= Anzeige =================
+    # ===== Anzeige =====
     def update_display(self):
         last_pos = QPointF(0, 0)
         if self.motif_item:
@@ -217,7 +177,7 @@ class BrassEtcherGUI(QMainWindow):
         super().showEvent(event)
         self.refit_view()
 
-    # ================= SVG =================
+    # ===== Import =====
     def load_svg(self):
         path, _ = QFileDialog.getOpenFileName(self, "SVG auswählen", "", "SVG Dateien (*.svg)")
         if not path:
@@ -238,33 +198,11 @@ class BrassEtcherGUI(QMainWindow):
         print("✅ SVG geladen.")
         self.refit_view()
 
-    # ================= Gerber =================
     def load_gerber(self):
-        if load_layer is None:
-            print("❌ pcb-tools nicht installiert. -> pip install pcb-tools")
-            return
-
         path, _ = QFileDialog.getOpenFileName(self, "Gerber auswählen", "", "Gerber/ZIP (*.gbr *.ger *.zip)")
         if not path:
             return
-
-        files = []
-        tempdir = None
-        try:
-            if path.lower().endswith(".zip"):
-                tempdir = tempfile.mkdtemp(prefix="gerber_")
-                with zipfile.ZipFile(path, "r") as zf:
-                    zf.extractall(tempdir)
-                for root, _, fnames in os.walk(tempdir):
-                    for fn in fnames:
-                        if fn.lower().endswith((".gbr", ".ger", ".gtl", ".gbl", ".gto", ".gbo", ".gts", ".gbs")):
-                            files.append(os.path.join(root, fn))
-            else:
-                files = [path]
-        except Exception as e:
-            print(f"❌ ZIP Fehler: {e}")
-            return
-
+        files, tempdir = collect_gerber_files(path)
         if not files:
             print("⚠ Keine Gerber gefunden.")
             return
@@ -274,68 +212,19 @@ class BrassEtcherGUI(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             print("❌ Abbruch.")
             return
-        selected_names = set(dlg.selected_names())
+        selected = set(dlg.selected_names())
 
-        geoms = []
-        for f in files:
-            if Path(f).name not in selected_names:
-                continue
-            try:
-                layer = load_layer(f)
-                geom = self._gerber_layer_to_shapely(layer)
-                if geom:
-                    geoms.append(geom)
-            except Exception as e:
-                print(f"⚠ Fehler {f}: {e}")
-
-        if not geoms:
+        combined = load_gerber_files(files, selected)
+        if not combined:
             print("⚠ Keine Geometrie erzeugt.")
             return
-
-        combined = sops.unary_union(geoms)
-        minx, miny, _, _ = combined.bounds
-        combined = affinity.translate(combined, xoff=-minx, yoff=-miny)
-        combined = affinity.scale(combined, xfact=-1, yfact=-1, origin=(0, 0))
-        minx, miny, _, _ = combined.bounds
-        combined = affinity.translate(combined, xoff=-minx, yoff=-miny)
 
         self.motif_geom = combined
         self.update_motif_item(keep_pos=False)
         print("✅ Gerber importiert.")
         self.refit_view()
 
-    def _gerber_layer_to_shapely(self, layer):
-        polys = []
-        unit_scale = 25.4 if getattr(layer, "units", None) == "inch" else 1.0
-        for prim in getattr(layer, "primitives", []):
-            try:
-                if isinstance(prim, Region):
-                    for poly in prim.polygons:
-                        pts = [(p.x * unit_scale, p.y * unit_scale) for p in poly]
-                        if len(pts) >= 3:
-                            polys.append(sgeom.Polygon(pts))
-                elif isinstance(prim, Circle):
-                    cx, cy = prim.position.x * unit_scale, prim.position.y * unit_scale
-                    r = (prim.diameter * unit_scale) / 2.0
-                    polys.append(sgeom.Point(cx, cy).buffer(r, resolution=32))
-                elif isinstance(prim, Rectangle):
-                    cx, cy = prim.position.x * unit_scale, prim.position.y * unit_scale
-                    w, h = prim.width * unit_scale, prim.height * unit_scale
-                    polys.append(sgeom.box(cx - w/2, cy - h/2, cx + w/2, cy + h/2))
-                elif isinstance(prim, Line):
-                    x1, y1 = prim.start.x * unit_scale, prim.start.y * unit_scale
-                    x2, y2 = prim.end.x * unit_scale, prim.end.y * unit_scale
-                    width = (prim.width or 0) * unit_scale
-                    if width > 0:
-                        line = sgeom.LineString([(x1, y1), (x2, y2)])
-                        polys.append(line.buffer(width/2, cap_style=1, join_style=1))
-            except Exception as e:
-                print(f"⚠ Fehler Primitive: {e}")
-        if not polys:
-            return None
-        return sops.unary_union(polys)
-
-    # ================= Motiv =================
+    # ===== Motiv =====
     def rescale_svg_only(self):
         if not self.motif_geom:
             return
@@ -382,7 +271,7 @@ class BrassEtcherGUI(QMainWindow):
         self.motif_item = item
         self.motif_item.setPos(last_pos if keep_pos else QPointF(0, 0))
 
-    # ================= Spiegeln & Rotieren =================
+    # ===== Spiegeln & Rotieren =====
     def mirror_vertical(self):
         if not self.motif_geom:
             return
@@ -413,13 +302,16 @@ class BrassEtcherGUI(QMainWindow):
         print("🔄 90° gedreht.")
         self.refit_view()
 
-    # ================= Export =================
+
+    # ===== Export =====
     def save_dialog(self):
         if not self.motif_geom:
             print("⚠ Kein Motiv.")
             return
         out, _ = QFileDialog.getSaveFileName(
-            self, "Exportieren als...", "output.stl", "STL-Dateien (*.stl);;3MF-Dateien (*.3mf)"
+            self, "Exportieren als...",
+            "output.stl",
+            "STL-Dateien (*.stl);;3MF-Dateien (*.3mf)"
         )
         if not out:
             return
@@ -431,12 +323,3 @@ class BrassEtcherGUI(QMainWindow):
             print(f"✅ {fmt.upper()} exportiert: {out}")
         except Exception as e:
             print(f"❌ Export fehlgeschlagen: {e}")
-
-    # ================= Tastenkürzel =================
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_R:
-            self.rotate_90()
-        elif event.key() == Qt.Key_Z:
-            self.center_svg()
-        else:
-            super().keyPressEvent(event)
